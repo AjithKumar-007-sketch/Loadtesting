@@ -24,6 +24,7 @@ import base64
 import hashlib
 import json
 import os
+import statistics
 import subprocess
 import time
 import wave
@@ -95,6 +96,38 @@ def redact(obj):
     if isinstance(obj, list):
         return [redact(v) for v in obj]
     return obj
+
+
+async def fetch_call_record(session, base, headers, call_id, wait_for_metrics=20):
+    """GET the call record; if its timing metrics are not stored yet, retry for up to wait_for_metrics seconds."""
+    from call_latency import has_metrics
+    deadline = time.monotonic() + wait_for_metrics
+    while True:
+        async with session.get(f"{base}/v1/calls/{call_id}", headers=headers) as resp:
+            status, body = resp.status, await resp.json(content_type=None)
+        if status >= 300 or has_metrics(body) or time.monotonic() > deadline:
+            return status, body
+        await asyncio.sleep(2)
+
+
+def write_latency_pdf(call_id, record, out):
+    """Latency PDF for this call next to the result JSON: results/<name>_latency_<call id>.pdf."""
+    from call_latency import pdf_for_call
+    path = Path(out).with_name(f"{Path(out).stem}_latency_{call_id}.pdf")
+    try:
+        res = pdf_for_call(record, call_id, path)
+    except Exception as e:  # never fail the call test because of the report
+        print(f"  latency PDF failed: {e}")
+        return None
+    if res is None:
+        print("  latency PDF: no timing metrics in the call record yet (PDF says so)")
+    else:
+        totals = sorted(t["total"] for t in res["turns"])
+        if totals:
+            print(f"  latency: {len(totals)} turns, median {statistics.median(totals):.0f} ms, "
+                  f"slowest {totals[-1]:.0f} ms, {sum(v > 3000 for v in totals)} above 3 s")
+    print(f"Latency PDF: {path}")
+    return str(path)
 
 
 class SpeechWorker:
@@ -845,6 +878,8 @@ async def main():
                         "or as audio (old behaviour)")
     p.add_argument("--llm-timeout", type=float, default=10,
                    help="dynamic mode: max seconds per Gemini request before trying the next model (default 10)")
+    p.add_argument("--no-latency-pdf", action="store_true",
+                   help="skip the per-call latency PDF (default: written next to the result JSON)")
     args = p.parse_args()
     globals()["END_OF_SPEECH_S"] = args.end_of_speech
 
@@ -917,15 +952,18 @@ async def main():
                                                     audio_path=Path(out).with_suffix(".wav"),
                                                     settle_time=args.settle, llm_timeout=args.llm_timeout,
                                                     llm_input=args.llm_input)
+                record = None
                 if result.get("call_id"):
                     await asyncio.sleep(3)
-                    async with session.get(f"{base}/v1/calls/{result['call_id']}", headers=headers) as resp:
-                        result["call_record_http_status"] = resp.status
-                        result["call_record"] = redact(await resp.json(content_type=None))
+                    result["call_record_http_status"], record = await fetch_call_record(
+                        session, base, headers, result["call_id"])
+                    result["call_record"] = redact(record)
                 result["mode"] = f"Dynamic AI Caller ({ai_config['provider'].title()})"
                 Path(out).write_text(json.dumps(result, indent=2, default=str))
                 passed += result["success"]
                 print_result(result, out, i, len(patients))
+                if record and result["call_record_http_status"] < 300 and not args.no_latency_pdf:
+                    write_latency_pdf(result["call_id"], record, out)
 
             print(f"\nDynamic Testing Complete: {passed}/{len(patients)} calls passed.")
             return 0 if passed == len(patients) else 2
@@ -994,11 +1032,12 @@ async def main():
             result = await run_one_user(session, base, headers, agent_id, turns,
                                         args.greeting_timeout, args.reply_timeout, args.livekit_url,
                                         audio_path=Path(out).with_suffix(".wav"))
+            record = None
             if result.get("call_id"):
                 await asyncio.sleep(3)  # let the wrapper store the call record
-                async with session.get(f"{base}/v1/calls/{result['call_id']}", headers=headers) as resp:
-                    result["call_record_http_status"] = resp.status
-                    result["call_record"] = redact(await resp.json(content_type=None))
+                result["call_record_http_status"], record = await fetch_call_record(
+                    session, base, headers, result["call_id"])
+                result["call_record"] = redact(record)
             result["mode"] = mode_name
             result["turns_summary"] = [
                 {
@@ -1014,6 +1053,8 @@ async def main():
             Path(out).write_text(json.dumps(result, indent=2, default=str))
             passed += result["success"]
             print_result(result, out, i, args.runs)
+            if record and result["call_record_http_status"] < 300 and not args.no_latency_pdf:
+                write_latency_pdf(result["call_id"], record, out)
 
     if args.runs > 1:
         print(f"\nDone: {passed}/{args.runs} calls passed. Build the report with: python make_report.py")

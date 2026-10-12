@@ -187,7 +187,7 @@ def write_pdf(path, report, all_turns):
     try:
         import reportlab  # noqa: F401
     except ImportError:
-        sys.exit("PDF needs reportlab: pip install reportlab   (or run with --no-pdf)")
+        raise RuntimeError("PDF needs reportlab: pip install reportlab") from None
     from reportlab.graphics.charts.barcharts import VerticalBarChart
     from reportlab.graphics.charts.legends import Legend
     from reportlab.graphics.shapes import Drawing, Line, String
@@ -310,6 +310,18 @@ def write_pdf(path, report, all_turns):
     doc.build(story)
 
 
+def has_metrics(call):
+    return any(i.get("type") == "metrics" for i in (call.get("flow_trace") or []))
+
+
+def pdf_for_call(call, call_id, path):
+    """Write the latency PDF for one already-fetched call record. Returns the analysis (None if no metrics)."""
+    res = analyse(call)
+    turns = [(call_id, i, t) for i, t in enumerate(res["turns"], 1)] if res else []
+    write_pdf(str(path), [(call_id, res, None)], turns)
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("call_ids", nargs="*")
@@ -374,7 +386,10 @@ def main():
         print_overall(all_turns)
     if not opts.no_pdf:
         path = opts.pdf or f"latency_report_{datetime.now():%Y%m%d_%H%M%S}.pdf"
-        write_pdf(path, report, all_turns)
+        try:
+            write_pdf(path, report, all_turns)
+        except RuntimeError as e:
+            sys.exit(f"{e}   (or run with --no-pdf)")
         print(f"\nPDF report: {os.path.abspath(path)}")
 
 
