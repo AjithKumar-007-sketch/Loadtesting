@@ -1,0 +1,37 @@
+[
+  {
+    "first_name": "Anna",
+    "last_name": "Beckett",
+    "dob": "October 4th, 1973",
+    "phone": "9876543210",
+    "specialty": "Cardiology"
+  },
+  {
+    "first_name": "Alice",
+    "last_name": "Johnson",
+    "dob": "March 15th, 1990",
+    "phone": "8765432109",
+    "specialty": "Dermatology"
+  },
+  {
+    "first_name": "Robert",
+    "last_name": "Williams",
+    "dob": "July 4th, 1982",
+    "phone": "7654321098",
+    "specialty": "Family Medicine"
+  },
+  {
+    "first_name": "Emily",
+    "last_name": "Davis",
+    "dob": "November 12th, 1988",
+    "phone": "6543210987",
+    "specialty": "Orthopedic Surgery"
+  },
+  {
+    "first_name": "Michael",
+    "last_name": "Brown",
+    "dob": "January 25th, 1975",
+    "phone": "5432109876",
+    "specialty": "Optometry"
+  }
+]

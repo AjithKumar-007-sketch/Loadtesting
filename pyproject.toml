@@ -1,0 +1,28 @@
+[project]
+name = "livekit-loadtest-tools"
+version = "0.1.0"
+description = "Livekit Loadtest Tools"
+authors = [
+    {name = "thinhdanggroup",email = "dinhluchvc@gmail.com"}
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-multipart (>=0.0.20,<0.0.21)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+pytest-asyncio = "^0.23.7"
+fastapi = "^0.114.2"
+websockets = "^13.0.1"
+uvicorn = "^0.30.6"
+livekit-agents = "1.1.1"
+numpy = "^2.2.3"
+livekit = "^1.0.10"
