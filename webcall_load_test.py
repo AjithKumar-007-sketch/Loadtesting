@@ -13,6 +13,8 @@ Config is read from .env:
     WRAPPER_USERNAME   login email
     WRAPPER_PASSWORD   login password
     AGENT_ID           agent to call
+    WRAPPER_HOST       optional: Host header for every AI Labs API request (the server picks the tenant
+                       from it), e.g. ailabs.healthviewx.com when calling the server by IP
 
 Usage:
     python webcall_load_test.py --question uploads/question.wav
@@ -24,8 +26,10 @@ import base64
 import hashlib
 import json
 import os
+import re
 import statistics
 import subprocess
+import threading
 import time
 import wave
 from datetime import datetime
@@ -75,6 +79,12 @@ def load_env(path=".env"):
             os.environ.setdefault(k.strip(), v.strip())
 
 
+def host_header():
+    """Host header for AI Labs API requests when WRAPPER_HOST is set (tenant is chosen by host)."""
+    host = os.environ.get("WRAPPER_HOST", "").strip()
+    return {"Host": host} if host else {}
+
+
 def find_key(obj, names):
     """Return the first value whose key is in names, searching nested dicts."""
     if isinstance(obj, dict):
@@ -110,24 +120,90 @@ async def fetch_call_record(session, base, headers, call_id, wait_for_metrics=20
         await asyncio.sleep(2)
 
 
-def write_latency_pdf(call_id, record, out):
+def write_latency_pdf(call_id, record, out, caller_turns=None):
     """Latency PDF for this call next to the result JSON: results/<name>_latency_<call id>.pdf."""
     from call_latency import pdf_for_call
     path = Path(out).with_name(f"{Path(out).stem}_latency_{call_id}.pdf")
     try:
-        res = pdf_for_call(record, call_id, path)
+        res = pdf_for_call(record, call_id, path, caller_turns)
     except Exception as e:  # never fail the call test because of the report
         print(f"  latency PDF failed: {e}")
         return None
     if res is None:
         print("  latency PDF: no timing metrics in the call record yet (PDF says so)")
     else:
-        totals = sorted(t["total"] for t in res["turns"])
+        totals = sorted(t["wait"] for t in res["turns"])  # real wait (server clock)
         if totals:
-            print(f"  latency: {len(totals)} turns, median {statistics.median(totals):.0f} ms, "
+            print(f"  real wait: {len(totals)} turns, median {statistics.median(totals):.0f} ms, "
                   f"slowest {totals[-1]:.0f} ms, {sum(v > 3000 for v in totals)} above 3 s")
     print(f"Latency PDF: {path}")
     return str(path)
+
+
+def watch_transcriptions(room, log, tasks):
+    """Log the live transcriptions the agent publishes (LiveKit topic lk.transcription, or the older
+    transcription_received event) with the bot's own clock, so STT time can be measured per turn."""
+    def on_stream(reader, sender):
+        async def read():
+            text = await reader.read_all()
+            a = reader.info.attributes or {}  # final flag can arrive in the stream trailer, so read it at the end
+            log("transcription", sender=sender, track=a.get("lk.transcribed_track_id"),
+                final=str(a.get("lk.transcription_final", "")).lower() == "true",
+                segment=a.get("lk.segment_id"), text=text[:120])
+        tasks.append(asyncio.create_task(read()))
+    try:
+        room.register_text_stream_handler("lk.transcription", on_stream)
+    except Exception as e:
+        log("transcription_watch_failed", error=str(e))
+    room.on("transcription_received", lambda segments, participant, publication: [
+        log("transcription", sender=getattr(participant, "identity", None), track=getattr(publication, "sid", None),
+            final=bool(s.final), segment=s.id, text=s.text[:120]) for s in segments])
+
+
+def trailing_silence_ms(samples, win_ms=20):
+    """Silence after the last spoken word in the caller's clip (speech TTS pads the end), so STT can be timed
+    from when the voice actually stops, not from when the whole clip has been sent."""
+    win = SAMPLE_RATE * win_ms // 1000
+    n = len(samples) // win
+    if n == 0:
+        return 0
+    rms = np.sqrt((samples[:n * win].astype(np.float64).reshape(n, win) ** 2).mean(axis=1))
+    voiced = np.nonzero(rms > max(300.0, 0.05 * rms.max()))[0]
+    if voiced.size == 0:
+        return 0
+    return round((len(samples) - (voiced[-1] + 1) * win) / SAMPLE_RATE * 1000)
+
+
+def add_bot_stt(result):
+    """STT time per turn from the bot's clock: caller's voice stops -> last final transcript of the caller's words.
+    Adds turn["stt_bot_ms"] and result["stt_bot"]; needs the agent to publish transcriptions to the room."""
+    events = result.get("events") or []
+    mic_sid = next((e.get("sid") for e in events if e["event"] == "mic_published"), None)
+    finals = [e for e in events if e["event"] == "transcription" and e.get("final")
+              and (mic_sid is None or e.get("track") == mic_sid)]
+    starts = {e["turn"]: e["t_ms"] for e in events if e["event"] == "turn_user_speak_start"}
+    # caller's voice stops = clip fully sent minus the clip's trailing silence
+    ends = {e["turn"]: e["t_ms"] - (e.get("trailing_silence_ms") or 0)
+            for e in events if e["event"] == "turn_user_speak_end"}
+    by_turn = {}
+    for n, t_end in ends.items():
+        nxt = min([t for k, t in starts.items() if k > n] or [float("inf")])
+        hits = [e["t_ms"] for e in finals if starts.get(n, t_end) <= e["t_ms"] < nxt]
+        if hits:
+            by_turn[n] = max(hits) - t_end
+    for t in result.get("turns") or []:
+        if t.get("turn") in by_turn:
+            t["stt_bot_ms"] = by_turn[t["turn"]]
+    seen = sum(1 for e in events if e["event"] == "transcription")
+    result["stt_bot"] = {"transcription_events": seen, "final_caller_transcripts": len(finals),
+                         "turns_measured": len(by_turn), "stt_ms_by_turn": by_turn}
+    if by_turn:
+        v = sorted(by_turn.values())
+        print(f"  STT (bot clock, caller stops -> final transcript): {len(v)} turns, "
+              f"median {statistics.median(v):.0f} ms, max {v[-1]:.0f} ms")
+    else:
+        print(f"  STT (bot clock): not measurable - {seen} transcription event(s) received from the room"
+              + (" (agent does not publish transcriptions)" if not seen else ""))
 
 
 class SpeechWorker:
@@ -164,10 +240,16 @@ class SpeechWorker:
 
 
 _speech_worker = None
+_speech_lock = threading.Lock()  # one speech process, shared by parallel calls: one request at a time
 
 
 def text_to_wav(text, path):
     """Speak text with the Windows built-in voice into a 16 kHz mono 16-bit WAV."""
+    with _speech_lock:
+        _text_to_wav(text, path)
+
+
+def _text_to_wav(text, path):
     global _speech_worker
     Path(path).parent.mkdir(exist_ok=True)
     try:
@@ -294,6 +376,7 @@ class AgentListener:
     def __init__(self):
         self.tracks = []
         self.track_received_at = None
+        self.closed = False  # set when the room disconnects: stop waiting for audio
 
     def consume(self, track):
         if self.track_received_at is None:
@@ -308,7 +391,7 @@ class AgentListener:
 
     async def wait_for_utterance_start(self, after, timeout):
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not self.closed:
             for tl in self.tracks:
                 for u in tl.utterances:
                     if u[0] >= after:
@@ -318,7 +401,7 @@ class AgentListener:
 
     async def wait_for_utterance_end(self, utt, timeout):
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and utt[1] is None:
+        while time.monotonic() < deadline and utt[1] is None and not self.closed:
             await asyncio.sleep(0.05)
         return utt[1]
 
@@ -342,25 +425,78 @@ class AgentListener:
         return first_utt, last_end
 
 
-class Mic:
-    """Publishes a continuous mic track: silence, or speech when asked."""
+class NoiseGenerator:
+    """Generates synthetic background noise frames (16kHz mono int16) to test agent noise cancellation."""
 
-    def __init__(self):
+    def __init__(self, noise_type="none", noise_level=0.0):
+        self.noise_type = (noise_type or "none").lower()
+        self.noise_level = max(0.0, min(1.0, float(noise_level)))
+        self.sample_idx = 0
+        self._next_click_sample = 0
+        self._click_decay = 0.0
+
+    def generate_frame(self, num_samples=FRAME_SAMPLES):
+        if self.noise_type in ("none", "off", "") or self.noise_level <= 0.0:
+            return np.zeros(num_samples, dtype=np.int16)
+
+        t = (np.arange(num_samples) + self.sample_idx) / SAMPLE_RATE
+        self.sample_idx += num_samples
+
+        if self.noise_type in ("low", "fan", "hum", "ac"):
+            # 1. Low Noise: Continuous stationary drone (60Hz + 120Hz + 180Hz hum + pink/room noise)
+            hum = 0.6 * np.sin(2 * np.pi * 60 * t) + 0.3 * np.sin(2 * np.pi * 120 * t) + 0.1 * np.sin(2 * np.pi * 180 * t)
+            white = np.random.normal(0, 0.2, num_samples)
+            signal = hum + white
+            amplitude = self.noise_level * 5000
+
+        elif self.noise_type in ("medium", "typing", "clicks"):
+            # 2. Medium Noise: Intermittent mechanical keyboard typing clicks with gentle baseline
+            signal = np.random.normal(0, 0.05, num_samples)
+            for i in range(num_samples):
+                if self.sample_idx - num_samples + i >= self._next_click_sample:
+                    self._click_decay = 1.0
+                    self._next_click_sample = (self.sample_idx - num_samples + i) + int(np.random.uniform(0.08, 0.28) * SAMPLE_RATE)
+                if self._click_decay > 0.01:
+                    click_val = self._click_decay * np.sin(2 * np.pi * 1200 * (i / SAMPLE_RATE))
+                    signal[i] += click_val * 2.5
+                    self._click_decay *= 0.85
+            amplitude = self.noise_level * 10000
+
+        elif self.noise_type in ("high", "cafe", "babble", "chatter"):
+            # 3. High Noise: Multi-speaker ambient cocktail babble / cafe chatter
+            v1 = np.sin(2 * np.pi * (250 + 50 * np.sin(2 * np.pi * 1.5 * t)) * t) * np.sin(2 * np.pi * 3.0 * t)
+            v2 = np.sin(2 * np.pi * (450 + 80 * np.sin(2 * np.pi * 2.2 * t)) * t) * np.sin(2 * np.pi * 4.5 * t)
+            v3 = np.sin(2 * np.pi * (750 + 120 * np.sin(2 * np.pi * 0.8 * t)) * t) * np.sin(2 * np.pi * 2.0 * t)
+            hiss = np.random.normal(0, 0.3, num_samples)
+            signal = (v1 * 0.4 + v2 * 0.3 + v3 * 0.3) + hiss
+            amplitude = self.noise_level * 8000
+        else:
+            signal = np.random.normal(0, 0.2, num_samples)
+            amplitude = self.noise_level * 4000
+
+        return np.clip(signal * amplitude, -32768, 32767).astype(np.int16)
+
+
+class Mic:
+    """Publishes a continuous mic track: silence (or noise), and speech (or mixed speech+noise) when asked."""
+
+    def __init__(self, noise_type="none", noise_level=0.0):
         self.source = rtc.AudioSource(SAMPLE_RATE, 1)
         self._queue = None
         self._running = True
         self.speech_done = asyncio.Event()
         self.recorder = Recorder()
+        self.noise_gen = NoiseGenerator(noise_type=noise_type, noise_level=noise_level)
 
     def say(self, samples):
         self.speech_done.clear()
         self._queue = samples
 
     async def run(self):
-        silence = np.zeros(FRAME_SAMPLES, dtype=np.int16)
         next_t = time.monotonic()
         pos = 0
         while self._running:
+            noise_frame = self.noise_gen.generate_frame(FRAME_SAMPLES)
             if self._queue is not None:
                 chunk = self._queue[pos:pos + FRAME_SAMPLES]
                 pos += FRAME_SAMPLES
@@ -369,8 +505,11 @@ class Mic:
                 if pos >= self._queue.size:
                     self._queue, pos = None, 0
                     self.speech_done.set()
+                # Mix caller speech with background noise
+                mixed = chunk.astype(np.int32) + noise_frame.astype(np.int32)
+                chunk = np.clip(mixed, -32768, 32767).astype(np.int16)
             else:
-                chunk = silence
+                chunk = noise_frame
             frame = rtc.AudioFrame.create(SAMPLE_RATE, 1, FRAME_SAMPLES)
             np.copyto(np.frombuffer(frame.data, dtype=np.int16), chunk)
             await self.source.capture_frame(frame)
@@ -383,8 +522,13 @@ class Mic:
 
 
 async def run_one_user(session, base, auth_headers, agent_id, turns, greeting_timeout, reply_timeout,
-                       livekit_url_override=None, audio_path=None):
-    r = {"started_at": datetime.now().isoformat(), "success": False, "steps": {}}
+                       livekit_url_override=None, audio_path=None, noise_type="none", noise_level=0.0):
+    r = {
+        "started_at": datetime.now().isoformat(),
+        "success": False,
+        "steps": {},
+        "noise": {"type": noise_type, "level": noise_level} if noise_type != "none" else None,
+    }
     t0 = time.monotonic()
 
     # 1. create the web call
@@ -412,7 +556,7 @@ async def run_one_user(session, base, auth_headers, agent_id, turns, greeting_ti
     # 2. join the room
     room = rtc.Room()
     listener = AgentListener()
-    mic = Mic()
+    mic = Mic(noise_type=noise_type, noise_level=noise_level)
     tasks = []
 
     events = r["events"] = []
@@ -433,7 +577,9 @@ async def run_one_user(session, base, auth_headers, agent_id, turns, greeting_ti
     room.on("track_published", lambda pub, p: log("track_published", participant=p.identity, kind=str(pub.kind)))
     room.on("track_subscription_failed", lambda p, sid, err: log("track_subscription_failed", participant=p.identity, error=str(err)))
     room.on("connection_state_changed", lambda s: log("connection_state", state=str(s)))
-    room.on("disconnected", lambda reason: log("disconnected", reason=str(reason)))
+    room.on("disconnected", lambda reason: (log("disconnected", reason=str(reason)),
+                                           setattr(listener, "closed", True)))
+    watch_transcriptions(room, log, tasks)
 
     try:
         t_join = time.monotonic()
@@ -443,8 +589,9 @@ async def run_one_user(session, base, auth_headers, agent_id, turns, greeting_ti
         log("connected", already_in_room=[p.identity for p in room.remote_participants.values()])
 
         track = rtc.LocalAudioTrack.create_audio_track("mic", mic.source)
-        await room.local_participant.publish_track(
+        mic_pub = await room.local_participant.publish_track(
             track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE))
+        log("mic_published", sid=mic_pub.sid)
         tasks.append(asyncio.create_task(mic.run()))
 
         # 3. greeting
@@ -476,7 +623,7 @@ async def run_one_user(session, base, auth_headers, agent_id, turns, greeting_ti
             mic.say(turn_samples)
             await mic.speech_done.wait()
             t_spoken = time.monotonic()
-            log("turn_user_speak_end", turn=turn_idx)
+            log("turn_user_speak_end", turn=turn_idx, trailing_silence_ms=trailing_silence_ms(turn_samples))
 
             first_utt, last_end = await listener.wait_for_full_reply(t_spoken, reply_timeout, settle_time=1.5)
             if not first_utt:
@@ -591,10 +738,35 @@ async def fetch_new_agent_text(session, base, auth_headers, call_id, seen):
     return " ".join(new).replace("—", "-").replace("�", "'").strip()
 
 
+def expects_answer(agent_text):
+    """True when the agent's words end on something the caller should answer (a question or a goodbye).
+    Holding lines such as "Sure, I'll find what's open." return False: a tool is running and more is coming."""
+    tail = re.split(r"(?<=[.!?])\s+", agent_text.strip())[-2:]
+    return any(s.rstrip().endswith("?") for s in tail) or bool(
+        re.search(r"\b(goodbye|bye|have a (great|good|nice) day)\b", agent_text, re.I))
+
+
+def appointment_id_from(record):
+    """Booking confirmation number the agent read out, e.g. 'APT-RXVRXM' (None if the call never got there)."""
+    for t in (record or {}).get("transcript") or []:
+        if t.get("role") == "assistant":
+            m = re.search(r"confirmation (?:number|code|id) is ([A-Z0-9][A-Z0-9-]{3,})", t.get("content") or "", re.I)
+            if m:
+                return m.group(1).rstrip(".")
+    return None
+
+
 async def run_one_dynamic_user(session, base, auth_headers, agent_id, patient, ai_config,
                                greeting_timeout, reply_timeout, livekit_url_override=None, audio_path=None,
-                               settle_time=1.5, llm_timeout=10, llm_input="text"):
-    r = {"started_at": datetime.now().isoformat(), "success": False, "steps": {}, "patient": patient}
+                               settle_time=1.5, llm_timeout=10, llm_input="text", hold_timeout=20, tag="",
+                               noise_type="none", noise_level=0.0):
+    r = {
+        "started_at": datetime.now().isoformat(),
+        "success": False,
+        "steps": {},
+        "patient": patient,
+        "noise": {"type": noise_type, "level": noise_level} if noise_type != "none" else None,
+    }
     t0 = time.monotonic()
 
     # 1. create the web call
@@ -621,7 +793,7 @@ async def run_one_dynamic_user(session, base, auth_headers, agent_id, patient, a
 
     room = rtc.Room()
     listener = AgentListener()
-    mic = Mic()
+    mic = Mic(noise_type=noise_type, noise_level=noise_level)
     tasks = []
     events = r["events"] = []
     t_join = time.monotonic()
@@ -641,7 +813,9 @@ async def run_one_dynamic_user(session, base, auth_headers, agent_id, patient, a
     room.on("track_published", lambda pub, p: log("track_published", participant=p.identity, kind=str(pub.kind)))
     room.on("track_subscription_failed", lambda p, sid, err: log("track_subscription_failed", participant=p.identity, error=str(err)))
     room.on("connection_state_changed", lambda s: log("connection_state", state=str(s)))
-    room.on("disconnected", lambda reason: log("disconnected", reason=str(reason)))
+    room.on("disconnected", lambda reason: (log("disconnected", reason=str(reason)),
+                                           setattr(listener, "closed", True)))
+    watch_transcriptions(room, log, tasks)
 
     temp_dir = Path("uploads/temp_audio")
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -654,8 +828,9 @@ async def run_one_dynamic_user(session, base, auth_headers, agent_id, patient, a
         log("connected", already_in_room=[p.identity for p in room.remote_participants.values()])
 
         track = rtc.LocalAudioTrack.create_audio_track("mic", mic.source)
-        await room.local_participant.publish_track(
+        mic_pub = await room.local_participant.publish_track(
             track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE))
+        log("mic_published", sid=mic_pub.sid)
         tasks.append(asyncio.create_task(mic.run()))
 
         first_name = patient.get("first_name", "John")
@@ -673,7 +848,7 @@ async def run_one_dynamic_user(session, base, auth_headers, agent_id, patient, a
             f"- Date of Birth: {dob}\n"
             f"- Phone Number: {phone}\n"
             f"- Desired Specialty: {specialty}\n"
-            f"- Date/Time Preference: next Monday morning\n\n"
+            f"- Date/Time Preference: {patient.get('time_preference', 'next Monday morning')}\n\n"
             f"Rules:\n"
             f"1. Be extremely concise (1 short sentence, maximum 10-12 words). Speak naturally as a caller.\n"
             f"2. Answer directly what the receptionist asks. If asked for full name, give both. If asked for first name only, give first name.\n"
@@ -707,14 +882,36 @@ async def run_one_dynamic_user(session, base, auth_headers, agent_id, patient, a
                 break
 
             # 1. Generate caller response via Gemini or OpenAI
-            t_llm = time.monotonic()
             llm_info = {}
             # Prefer the agent's words as text (from the wrapper transcript): small, fast LLM requests.
             # Fall back to sending the agent's audio when the text is not there yet.
             agent_text = None
+            hold_ms = 0
             if llm_input == "text":
                 agent_text = await fetch_new_agent_text(session, base, auth_headers, call_id, seen_agent_msgs)
+                # The agent often says a holding line ("Sure, I'll find what's open.") and goes quiet while a
+                # tool runs. Answering that talks over the real question, so keep listening until it asks one.
+                t_hold = time.monotonic()
+                while agent_text and not expects_answer(agent_text) and time.monotonic() - t_hold < hold_timeout:
+                    more_utt, more_end = await listener.wait_for_full_reply(
+                        last_end, hold_timeout - (time.monotonic() - t_hold), settle_time=settle_time)
+                    if not more_utt:
+                        break
+                    last_end, t_detected = more_end, time.monotonic()
+                    more = None
+                    for _ in range(4):  # the wrapper transcript can lag the audio by a moment
+                        more = await fetch_new_agent_text(session, base, auth_headers, call_id, seen_agent_msgs)
+                        if more:
+                            break
+                        await asyncio.sleep(0.5)
+                    if more:
+                        agent_text = f"{agent_text} {more}"
+                hold_ms = round((time.monotonic() - t_hold) * 1000)
+                if room.connection_state == rtc.ConnectionState.CONN_DISCONNECTED:
+                    log("call_disconnected_by_agent", turn=turn_idx)
+                    break
             agent_source = "transcript" if agent_text else "audio"
+            t_llm = time.monotonic()  # after any hold, so detect + llm + tts add up to caller_gap
             if not agent_text:
                 agent_wav = temp_dir / f"agent_turn_{turn_idx}_{time.time_ns()}.wav"
                 extract_agent_audio(listener.tracks, first_utt[0], last_end, agent_wav)
@@ -764,7 +961,7 @@ async def run_one_dynamic_user(session, base, auth_headers, agent_id, patient, a
             t_speak = time.monotonic()
             # caller-side delay = agent stopped talking -> caller starts talking
             timing = {
-                "detect_wait_ms": round((t_detected - last_end) * 1000),
+                "detect_wait_ms": round((t_llm - last_end) * 1000),  # sure agent finished + transcript fetch
                 "llm_ms": round((t_tts - t_llm) * 1000),
                 "tts_ms": round((t_speak - t_tts) * 1000),
                 "caller_gap_ms": round((t_speak - last_end) * 1000),
@@ -775,26 +972,29 @@ async def run_one_dynamic_user(session, base, auth_headers, agent_id, patient, a
                 "question_ms": round(len(samples) / SAMPLE_RATE * 1000),
                 "caller_timing": timing,
                 "agent_text_source": agent_source,
+                "agent_text": agent_text,
             }
+            if hold_ms > 1000:
+                turn_info["agent_hold_ms"] = hold_ms  # waited this long for the agent to finish (tool running)
             if llm_info:
                 turn_info["llm_model"] = llm_info.get("model")
                 if llm_info.get("attempts"):
                     turn_info["llm_failed_attempts"] = llm_info["attempts"]
             slow = "".join(f" [{a['model']}: {a['status']} after {a['ms']} ms]" for a in llm_info.get("attempts", []))
-            print(f"  [Caller Turn {turn_idx:>2}]: {caller_text}")
-            print(f"      caller delay {timing['caller_gap_ms']/1000:.1f}s = wait {timing['detect_wait_ms']/1000:.1f}s"
+            print(f"  {tag}[Caller Turn {turn_idx:>2}]: {caller_text}")
+            print(f"      {tag}caller delay {timing['caller_gap_ms']/1000:.1f}s = wait {timing['detect_wait_ms']/1000:.1f}s"
                   f" + LLM {timing['llm_ms']/1000:.1f}s ({agent_source}) + speech {timing['tts_ms']/1000:.1f}s{slow}")
 
             log("turn_user_speak_start", turn=turn_idx, text=caller_text)
             mic.say(samples)
             await mic.speech_done.wait()
             t_spoken = time.monotonic()
-            log("turn_user_speak_end", turn=turn_idx)
+            log("turn_user_speak_end", turn=turn_idx, trailing_silence_ms=trailing_silence_ms(samples))
 
             first_utt, last_end = await listener.wait_for_full_reply(t_spoken, reply_timeout, settle_time=settle_time)
             t_detected = time.monotonic()
             if not first_utt:
-                if "thank you" in caller_text.lower() or "no" in caller_text.lower():
+                if re.search(r"\b(thank you|no|bye)\b", caller_text, re.I):
                     log("call_ended_cleanly", turn=turn_idx)
                     r["turns"].append(turn_info)
                     break
@@ -878,10 +1078,31 @@ async def main():
                         "or as audio (old behaviour)")
     p.add_argument("--llm-timeout", type=float, default=10,
                    help="dynamic mode: max seconds per Gemini request before trying the next model (default 10)")
+    p.add_argument("--hold-timeout", type=float, default=20,
+                   help="dynamic mode: when the agent's words are not a question (e.g. 'Sure, I'll find what's "
+                        "open.'), keep listening up to this many seconds before answering (default 20)")
+    p.add_argument("--concurrent", type=int, default=1,
+                   help="dynamic mode: number of calls running at the same time (default 1 = one after another)")
+    p.add_argument("--stagger", type=float, default=1.0,
+                   help="dynamic mode with --concurrent: seconds between call starts (default 1)")
     p.add_argument("--no-latency-pdf", action="store_true",
                    help="skip the per-call latency PDF (default: written next to the result JSON)")
+    p.add_argument("--noise-type", choices=["none", "low", "medium", "high", "fan", "typing", "cafe", "hum", "babble"],
+                   default="none",
+                   help="Inject background noise into caller microphone to test agent noise cancellation: "
+                        "'low' (fan/hum drone), 'medium' (keyboard typing clicks), 'high' (cafe chatter/babble)")
+    p.add_argument("--noise-level", type=float, default=None,
+                   help="Background noise level from 0.0 to 1.0 (defaults: 0.15 for low, 0.25 for medium, 0.40 for high)")
     args = p.parse_args()
     globals()["END_OF_SPEECH_S"] = args.end_of_speech
+
+    if args.noise_level is None:
+        noise_defaults = {
+            "low": 0.15, "fan": 0.15, "hum": 0.15,
+            "medium": 0.25, "typing": 0.25, "clicks": 0.25,
+            "high": 0.40, "cafe": 0.40, "babble": 0.40,
+        }
+        args.noise_level = noise_defaults.get(args.noise_type, 0.0)
 
     load_env()
     if not args.livekit_url and os.environ.get("LIVEKIT_URL"):
@@ -922,11 +1143,13 @@ async def main():
         if not p_path.exists():
             print(f"Error: Patients file not found: {p_path}")
             return 1
-        patients = json.loads(p_path.read_text())[:args.patient_count]
+        pool = json.loads(p_path.read_text())
+        patients = [pool[k % len(pool)] for k in range(args.patient_count)]  # repeats patients if count > file
         print(f"Loaded {len(patients)} patient profile(s) from {p_path} for dynamic testing.")
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{base}/v1/auth/login", data={"username": user, "password": pwd}) as resp:
+            async with session.post(f"{base}/v1/auth/login", data={"username": user, "password": pwd},
+                                    headers=host_header()) as resp:
                 body = await resp.json(content_type=None)
                 if resp.status >= 300:
                     print(f"Login failed: HTTP {resp.status} {redact(body)}")
@@ -935,35 +1158,59 @@ async def main():
             if not api_token:
                 print(f"Login OK but no token found in response keys: {list(body)}")
                 return 1
-            headers = {"Authorization": f"Bearer {api_token}"}
+            headers = {"Authorization": f"Bearer {api_token}", **host_header()}
             print(f"Logged in. Calling agent {agent_id} dynamically for {len(patients)} patient(s) ...")
 
-            passed = 0
-            for i, patient in enumerate(patients, 1):
-                if i > 1:
+            concurrent = max(1, args.concurrent)
+            if concurrent > 1:
+                print(f"Running {len(patients)} call(s), up to {concurrent} at the same time, "
+                      f"starting {args.stagger:g} s apart.")
+            gate = asyncio.Semaphore(concurrent)
+            finished = []  # (call_id, record, bot turns, result) for the combined summary
+
+            async def run_patient(i, patient):
+                if concurrent == 1 and i > 1:
                     await asyncio.sleep(args.pause)
+                elif concurrent > 1:
+                    await asyncio.sleep((i - 1) * args.stagger)
+                async with gate:
+                    return await one_patient(i, patient)
+
+            async def one_patient(i, patient):
+                tag = f"[P{i}] " if concurrent > 1 else ""
                 out = (args.output if args.output and len(patients) == 1
                        else f"results/dynamic_patient_{i}_{datetime.now():%Y%m%d_%H%M%S}.json")
                 Path(out).parent.mkdir(exist_ok=True)
                 print(f"\n==================================================")
-                print(f"Patient {i}/{len(patients)}: {patient.get('first_name')} {patient.get('last_name')} | DOB: {patient.get('dob')} | Specialty: {patient.get('specialty')}")
+                print(f"{tag}Patient {i}/{len(patients)}: {patient.get('first_name')} {patient.get('last_name')} | DOB: {patient.get('dob')} | Specialty: {patient.get('specialty')}")
                 result = await run_one_dynamic_user(session, base, headers, agent_id, patient, ai_config,
                                                     args.greeting_timeout, args.reply_timeout, args.livekit_url,
                                                     audio_path=Path(out).with_suffix(".wav"),
                                                     settle_time=args.settle, llm_timeout=args.llm_timeout,
-                                                    llm_input=args.llm_input)
+                                                    llm_input=args.llm_input, hold_timeout=args.hold_timeout,
+                                                    tag=tag,
+                                                    noise_type=args.noise_type, noise_level=args.noise_level)
                 record = None
                 if result.get("call_id"):
                     await asyncio.sleep(3)
                     result["call_record_http_status"], record = await fetch_call_record(
                         session, base, headers, result["call_id"])
                     result["call_record"] = redact(record)
+                    result["appointment_id"] = appointment_id_from(record)
                 result["mode"] = f"Dynamic AI Caller ({ai_config['provider'].title()})"
+                add_bot_stt(result)
                 Path(out).write_text(json.dumps(result, indent=2, default=str))
-                passed += result["success"]
                 print_result(result, out, i, len(patients))
-                if record and result["call_record_http_status"] < 300 and not args.no_latency_pdf:
-                    write_latency_pdf(result["call_id"], record, out)
+                if record and result["call_record_http_status"] < 300:
+                    finished.append((result["call_id"], record, result.get("turns"), result))
+                    if not args.no_latency_pdf:
+                        write_latency_pdf(result["call_id"], record, out, result.get("turns"))
+                return result
+
+            results = await asyncio.gather(*(run_patient(i, pt) for i, pt in enumerate(patients, 1)))
+            passed = sum(bool(r.get("success")) for r in results)
+            if concurrent > 1 and finished:
+                summarise_parallel(finished, concurrent, args.no_latency_pdf)
 
             print(f"\nDynamic Testing Complete: {passed}/{len(patients)} calls passed.")
             return 0 if passed == len(patients) else 2
@@ -1010,7 +1257,8 @@ async def main():
         print(f"  Turn {idx:>2}: {t_text}")
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(f"{base}/v1/auth/login", data={"username": user, "password": pwd}) as resp:
+        async with session.post(f"{base}/v1/auth/login", data={"username": user, "password": pwd},
+                                    headers=host_header()) as resp:
             body = await resp.json(content_type=None)
             if resp.status >= 300:
                 print(f"Login failed: HTTP {resp.status} {redact(body)}")
@@ -1019,7 +1267,7 @@ async def main():
         if not api_token:
             print(f"Login OK but no token found in response keys: {list(body)}")
             return 1
-        headers = {"Authorization": f"Bearer {api_token}"}
+        headers = {"Authorization": f"Bearer {api_token}", **host_header()}
         print(f"Logged in. Calling agent {agent_id} ({args.runs} call(s), one at a time) ...")
 
         passed = 0
@@ -1031,13 +1279,15 @@ async def main():
             Path(out).parent.mkdir(exist_ok=True)
             result = await run_one_user(session, base, headers, agent_id, turns,
                                         args.greeting_timeout, args.reply_timeout, args.livekit_url,
-                                        audio_path=Path(out).with_suffix(".wav"))
+                                        audio_path=Path(out).with_suffix(".wav"),
+                                        noise_type=args.noise_type, noise_level=args.noise_level)
             record = None
             if result.get("call_id"):
                 await asyncio.sleep(3)  # let the wrapper store the call record
                 result["call_record_http_status"], record = await fetch_call_record(
                     session, base, headers, result["call_id"])
                 result["call_record"] = redact(record)
+                result["appointment_id"] = appointment_id_from(record)
             result["mode"] = mode_name
             result["turns_summary"] = [
                 {
@@ -1050,6 +1300,7 @@ async def main():
                 }
                 for t in result.get("turns", [])
             ]
+            add_bot_stt(result)
             Path(out).write_text(json.dumps(result, indent=2, default=str))
             passed += result["success"]
             print_result(result, out, i, args.runs)
@@ -1061,12 +1312,43 @@ async def main():
     return 0 if passed == args.runs else 2
 
 
+def summarise_parallel(finished, concurrent, no_pdf):
+    """Real wait across all calls that ran in parallel, plus one combined latency PDF."""
+    import call_latency as cl
+    report, all_turns = [], []
+    for cid, record, bot_turns, _ in finished:
+        res = cl.analyse(record)
+        if res is not None:
+            res["caller_turns"] = bot_turns
+            all_turns += [(cid, i, t) for i, t in enumerate(res["turns"], 1)]
+        report.append((cid, res, None))
+    print("\n" + "=" * 50 + f"\nPARALLEL RUN: {len(finished)} call(s), up to {concurrent} at once")
+    for cid, _, _, result in finished:
+        print(f"  {cid}  appointment {result.get('appointment_id') or 'NONE'}")
+    waits = [t["wait"] for _, _, t in all_turns]
+    if waits:
+        print(f"  real wait over {len(waits)} turns: median {statistics.median(waits):.0f} ms, "
+              f"P90 {cl.pct(waits, 90):.0f} ms, {sum(w > 3000 for w in waits)} above 3 s, "
+              f"{sum(w <= 2500 for w in waits)} within 2.5 s")
+    if not no_pdf and all_turns:
+        path = f"results/parallel_{concurrent}x_{datetime.now():%Y%m%d_%H%M%S}_latency.pdf"
+        try:
+            cl.write_pdf(path, report, all_turns)
+            print(f"Combined latency PDF: {path}")
+        except Exception as e:
+            print(f"  combined PDF failed: {e}")
+
+
 def print_result(result, out, i, n):
     print("\n" + "=" * 50 + (f"  call {i}/{n}" if n > 1 else ""))
     print("RESULT:", "SUCCESS" if result["success"] else f"FAILED - {result.get('error')}")
     for k, v in result["steps"].items():
         print(f"  {k:<24} {v}")
     print(f"  call_id                  {result.get('call_id')}")
+    if result.get("noise"):
+        print(f"  noise_injection          {result['noise']['type']} (level {result['noise']['level']})")
+    if "appointment_id" in result:
+        print(f"  appointment_id           {result['appointment_id'] or 'NONE - booking was not confirmed'}")
     if result.get("patient"):
         p = result["patient"]
         print(f"  patient                  {p.get('first_name')} {p.get('last_name')} (DOB: {p.get('dob')})")
